@@ -1,39 +1,39 @@
-#! /usr/bin/env python3
-# _*_ coding: utf8 _*_
+#!/usr/bin/env python3
+import os, time
 
-import os
-from multiprocessing import shared_memory, Process
-import subprocess
+tube_d_w = "/tmp/dwtube1"
+tube_w_d = "/tmp/wdtube1"
 
-def f():
-    # Lancer directement worker.py (doit être exécutable)
-    subprocess.call(['./worker.py'])
+# Création tubes si n'existent pas
+for tube in (tube_d_w, tube_w_d):
+    if not os.path.exists(tube):
+        os.mkfifo(tube, 0o600)
 
-if __name__ == "__main__":
-    print('Début processus 1')
+print("Dispatcher prêt")
 
-    # Créer ou se connecter au segment mémoire partagé
-    try:
-        shm_segment1 = shared_memory.SharedMemory(name='012345', create=True, size=10)
-    except FileExistsError:
-        shm_segment1 = shared_memory.SharedMemory(name='012345', create=False)
+# Ouverture
+fifo_out = open(tube_d_w, "w")
+fifo_in  = open(tube_w_d, "r")
 
-    print('Nom du segment mémoire partagée :', shm_segment1.name)
-    print('Taille du segment mémoire partagée en octets via premier accès :', len(shm_segment1.buf))
+N = 5  # nombre de ping-pong
 
-    # Écrire les 10 octets initiaux
-    data = bytearray([74, 73, 72, 71, 70, 69, 68, 67, 66, 65])
-    shm_segment1.buf[:10] = data
+for i in range(N):
+    print(f"Dispatcher → ping {i}")
+    fifo_out.write("ping\n")
+    fifo_out.flush()  # IMPORTANT !
 
-    # Lancer le worker dans un autre processus
-    p = Process(target=f)
-    p.start()
-    print("Processus 1 : va se mettre en attente...\n")
-    p.join()
-    print("Processus 1 : fin d'attente.\n")
+    reply = fifo_in.readline().strip()
+    print(f"Réponse worker : {reply}")
 
-    # Nettoyer le segment mémoire
-    shm_segment1.close()
-    shm_segment1.unlink()
+# envoie signal d'arrêt
+fifo_out.write("STOP\n")
+fifo_out.flush()
+print("STOP envoyé au worker, fermeture...")
 
-    print('Fin processus 1')
+fifo_out.close()
+fifo_in.close()
+
+os.unlink(tube_d_w)
+os.unlink(tube_w_d)
+
+print("Dispatcher terminé")
