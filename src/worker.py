@@ -1,24 +1,29 @@
-#! /usr/bin/env python3
-# _*_ coding: utf8 _*_
-
+#!/usr/bin/env python3
 import os, sys
-from multiprocessing import shared_memory
-from multiprocessing import resource_tracker
 
-if __name__ == "__main__":
-    print('Début processus 2')
+tube_d_w = "/tmp/dwtube1"
+tube_w_d = "/tmp/wdtube1"
 
-    # Se connecter au segment mémoire partagé existant
-    shm_segment2 = shared_memory.SharedMemory(name='012345', create=False)
+print("Worker prêt")
 
-    # Éviter que le resource tracker tente de le supprimer à la fermeture
-    resource_tracker.unregister(f"/012345", "shared_memory")
+fifo_in  = open(tube_d_w, "r")
+fifo_out = open(tube_w_d, "w")
 
-    print('Nom du segment mémoire partagée :', shm_segment2.name)
-    print('Taille du segment mémoire partagée en octets via second accès :', len(shm_segment2.buf))
+while True:
+    msg = fifo_in.readline().strip()
+    if msg == "":
+        continue
 
-    # Lire uniquement les 10 premiers octets
-    print('Contenu du segment mémoire partagée (10 octets) :', bytes(shm_segment2.buf[:10]))
+    print(f"Worker reçoit : {msg}")
 
-    shm_segment2.close()
-    print('Fin processus 2')
+    if msg == "STOP":
+        print("Worker : arrêt demandé")
+        break
+
+    if msg == "ping":
+        fifo_out.write("pong\n")
+        fifo_out.flush()
+
+fifo_in.close()
+fifo_out.close()
+print("Worker terminé")
