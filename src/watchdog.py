@@ -1,14 +1,28 @@
-#!/usr/bin/env python3
-import os, time, signal, subprocess
-import sys
-from multiprocessing import Process
 
 # --- Constantes ---
 # Couleurs pour les messages
+import os
+import signal
+import socket
+import sys
+import time
+
 ERROR = '\033[91m'
 SUCCESS = '\033[92m'
 WARNING = '\033[93m'
 RESET = '\033[0m'
+
+# Configuration réseau
+HOST = '127.0.0.1'
+DISPATCHER_PORT = 2222
+WORKER_PORT = 2223
+
+# Sockets du dispatcher et du worker
+dispatcher_socket = None
+worker_socket = None
+
+# Variable globale pour gérer l'arrêt propre
+shutdown_requested = False
 
 # Variable globale pour le statut des processus
 process_status = {
@@ -16,163 +30,119 @@ process_status = {
     "worker": False
 }
 
-def start_dispatcher_process():
-    """Démarre le processus dispatcher"""
-    from dispatcher import main as dispatcher_main
+def handle_sigint(sig, frame):
+    """Gestionnaire pour SIGINT (Ctrl+C)"""
+    global shutdown_requested
+    if not shutdown_requested:
+        print(f"\n{WARNING}[WATCHDOG] - INFO : Signal d'arrêt reçu, arrêt en cours...{RESET}")
+        shutdown_requested = True
+
+signal.signal(signal.SIGINT, handle_sigint)
+signal.signal(signal.SIGTERM, handle_sigint)
+
+def connect_to_dispatcher_socket(dispatcher_socket):
+    """
+    Tente d'établir une connexion avec le dispatcher.
+    Retourne la socket connectée (ou None en cas d'erreur).
+    """
+    if dispatcher_socket is not None:
+        return dispatcher_socket
 
     try:
-        print(f"{WARNING}[WATCHDOG] : Démarrage du dispatcher...{RESET}")
-        # Utiliser subprocess au lieu de multiprocessing pour plus de contrôle
-        dispatcher_process = Process(target=dispatcher_main)
-        dispatcher_process.start()
-        time.sleep(2)  # Laisser le temps au dispatcher de démarrer
-        print(f"{SUCCESS}[WATCHDOG] : Dispatcher démarré (PID: {dispatcher_process.pid}){RESET}")
-        return dispatcher_process
-
-    except Exception as exception:
-        print(f"{ERROR}[WATCHDOG] : Erreur lors du démarrage du dispatcher: {exception}{RESET}")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((HOST, DISPATCHER_PORT))
+        print(f'{SUCCESS}[WATCHDOG] - INFO  : Connexion au dispatcher établie.{RESET}')
+        return s
+    except OSError as error:
+        print(f'{ERROR}[WATCHDOG] - ERROR : Impossible de se connecter au dispatcher : {error}{RESET}')
         return None
 
-def handler_sigusr2(signum, frame):
-    """Gestionnaire pour recevoir SIGUSR2 (OK reçu)"""
-    global process_status
-    # Quand un process répond, on le marque vivant
-    for k in process_status:
-        process_status[k] = True
-    print(f"{SUCCESS}[WATCHDOG] : Signal SIGUSR2 reçu - processus marqués vivants{RESET}")
+def connect_to_worker_socket(worker_socket):
+    """
+    Tente d'établir une connexion avec le worker.
+    Retourne la socket connectée (ou None en cas d'erreur).
+    """
+    if worker_socket is not None:
+        return worker_socket
 
-def is_process_alive(pid):
-    """Vérifie si un processus existe"""
     try:
-        if os.name == "posix":  # Unix/Linux/macOS
-            os.kill(pid, 0)  # Signal 0 = test d'existence
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((HOST, WORKER_PORT))
+        print(f'{SUCCESS}[WATCHDOG] - INFO  : Connexion au worker établie.{RESET}')
+        return s
+    except OSError as error:
+        print(f'{ERROR}[WATCHDOG] - ERROR : Impossible de se connecter au worker : {error}{RESET}')
+        return None
+
+def check_health(sock, name):
+    """Vérifie l'état d'un processus"""
+    try:
+        # Configurer un timeout de 30 secondes pour la réception
+        sock.settimeout(30.0)
+
+        # Envoyer le message de santé
+        sock.send(b'watchdog-health-test')
+
+        # Attendre une réponse (n'importe quelle donnée)
+        response = sock.recv(1024)
+
+        if response:
+            print(f'{SUCCESS}[WATCHDOG] - INFO  : {name} a répondu : {response!r}{RESET}')
             return True
-        else:
-            # Pour Windows (si nécessaire)
-            return os.system(f"tasklist /FI \"PID eq {pid}\" 2>NUL | find \"{pid}\" >NUL") == 0
-    except (OSError, ProcessLookupError):
+
+    except socket.timeout:
+        print(f'{ERROR}[WATCHDOG] - ERROR : Aucun message reçu de {name} dans la limite des 30 secondes (timeout){RESET}')
+        return False
+    except OSError as error:
+        print(f'{ERROR}[WATCHDOG] - ERROR : {name} ne répond pas : {error}{RESET}')
         return False
 
-def get_worker_pid():
-    """Récupère le PID du worker depuis le fichier"""
-    try:
-        with open("/tmp/worker.pid", "r") as worker_pid:
-            return int(worker_pid.read().strip())
-    except (FileNotFoundError, ValueError) as exception:
-        print(f"{WARNING}[WATCHDOG] : Impossible de lire le PID du worker: {exception}{RESET}")
-        return None
-
 def main():
-    global process_status
+    global dispatcher_socket, worker_socket, shutdown_requested
 
-    print(f"{SUCCESS}[WATCHDOG] : Watchdog démarré{RESET}")
-
-    # Configurer le gestionnaire de signal
-    signal.signal(signal.SIGUSR2, handler_sigusr2)
-
-    # Démarrer le dispatcher
-    dispatcher_process = start_dispatcher_process()
-    if not dispatcher_process:
-        print(f"{ERROR}[WATCHDOG] : Échec du démarrage du dispatcher{RESET}")
-        return 1
-
-    dispatcher_pid = dispatcher_process.pid
-
-    # Attendre que le worker soit lancé
-    print(f"{WARNING}[WATCHDOG] : Attente du démarrage du worker...{RESET}")
-    worker_pid = None
-    for attempt in range(10):  # 10 tentatives
-        worker_pid = get_worker_pid()
-        if worker_pid:
-            break
-        time.sleep(1)
-
-    if not worker_pid:
-        print(f"{ERROR}[WATCHDOG] : Worker non trouvé après 10 secondes{RESET}")
-        return 1
-
-    print(f"{SUCCESS}[WATCHDOG] : Surveillance - Dispatcher PID={dispatcher_pid}, Worker PID={worker_pid}{RESET}")
+    print(f'{SUCCESS}[WATCHDOG] - INFO : Watchdog démarré.{RESET}')
 
     try:
-        while True:
-            # Réinitialiser le statut
-            process_status = {"dispatcher": False, "worker": False}
+        while not shutdown_requested:
+            # Vérifier le dispatcher
+            dispatcher_socket = connect_to_dispatcher_socket(dispatcher_socket)
+            if dispatcher_socket:
+                if not check_health(dispatcher_socket, "Dispatcher"):
+                    dispatcher_socket = None
 
-            for processus, pid in [("dispatcher", dispatcher_pid), ("worker", worker_pid)]:
-                print(f"[WATCHDOG] : Vérification de {processus} (PID: {pid})")
+            time.sleep(5)
 
-                # Vérifier si le processus existe encore
-                if not is_process_alive(pid):
-                    print(f"{ERROR}[WATCHDOG] : {processus} n'existe plus, redémarrage...{RESET}")
+            if shutdown_requested:
+                break
 
-                    if processus == "dispatcher":
-                        dispatcher_process = start_dispatcher_process()
-                        if dispatcher_process:
-                            dispatcher_pid = dispatcher_process.pid
-                            # Récupérer le nouveau PID du worker
-                            time.sleep(2)
-                            worker_pid = get_worker_pid()
-                            if not worker_pid:
-                                print(f"{ERROR}[WATCHDOG] : Nouveau worker non trouvé{RESET}")
-                                continue
-                    else:
-                        print(f"{WARNING}[WATCHDOG] : Worker disparu, le dispatcher le relancera{RESET}")
-                        # Attendre que le dispatcher relance le worker
-                        time.sleep(3)
-                        worker_pid = get_worker_pid()
+            # Vérifier le worker
+            worker_socket = connect_to_worker_socket(worker_socket)
+            if worker_socket:
+                if not check_health(worker_socket, "Worker"):
+                    worker_socket = None
 
-                    continue
-
-                # Envoyer le signal de test
-                try:
-                    print(f"[WATCHDOG] : Envoi SIGUSR1 à {processus}")
-                    os.kill(pid, signal.SIGUSR1)
-                except (OSError, ProcessLookupError):
-                    print(f"{ERROR}[WATCHDOG] : {processus} n'existe plus lors de l'envoi du signal{RESET}")
-                    continue
-
-                # Attendre la réponse
-                time.sleep(2)
-
-                # Vérifier si le processus a répondu
-                if not process_status[processus]:
-                    print(f"{ERROR}[WATCHDOG] {processus} ne répond pas → kill{RESET}")
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        time.sleep(1)
-                    except (OSError, ProcessLookupError):
-                        pass
-
-                    if processus == "dispatcher":
-                        print(f"{WARNING}[WATCHDOG] Relance du dispatcher{RESET}")
-                        dispatcher_process = start_dispatcher_process()
-                        if dispatcher_process:
-                            dispatcher_pid = dispatcher_process.pid
-                            time.sleep(2)
-                            worker_pid = get_worker_pid()
-                    else:
-                        print(f"{WARNING}[WATCHDOG] Laisser dispatcher relancer worker{RESET}")
-                        time.sleep(3)
-                        worker_pid = get_worker_pid()
-                else:
-                    print(f"{SUCCESS}[WATCHDOG] {processus} répond correctement{RESET}")
-
-            print(f"{WARNING}[WATCHDOG] Pause de 10 secondes...{RESET}")
-            time.sleep(10)
+            time.sleep(5)
 
     except KeyboardInterrupt:
-        print(f"\n{WARNING}[WATCHDOG] Arrêt du watchdog demandé{RESET}")
+        print(f'\n{WARNING}[WATCHDOG] - INFO : Interruption clavier détectée{RESET}')
 
-        # Arrêter proprement les processus
-        try:
-            if is_process_alive(dispatcher_pid):
-                os.kill(dispatcher_pid, signal.SIGTERM)
-            if worker_pid and is_process_alive(worker_pid):
-                os.kill(worker_pid, signal.SIGTERM)
-        except:
-            pass
+    finally:
+        # Fermeture propre
+        if dispatcher_socket:
+            try:
+                dispatcher_socket.close()
+                print(f'{SUCCESS}[WATCHDOG] - SUCCESS : Connexion avec le Dispatcher correctement fermée.{RESET}')
+            except:
+                pass
 
-        return 0
+        if worker_socket:
+            try:
+                worker_socket.close()
+                print(f'{SUCCESS}[WATCHDOG] - SUCCESS : Connexion avec le Woker correctement fermée.{RESET}')
+            except:
+                pass
+
+        print(f'{SUCCESS}[WATCHDOG] - INFO : Watchdog arrêté{RESET}')
 
 if __name__ == "__main__":
     sys.exit(main())
