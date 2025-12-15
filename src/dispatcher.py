@@ -45,6 +45,14 @@ def setup_named_pipes():
             os.mkfifo(tube, 0o600)
     print(f"[Dispatcher] - INFO : Tubes nommés configurés")
 
+def open_named_pipes():
+    """Overture des tubes nommés"""
+    fifo_dw = os.open(TUBE_D_W, os.O_RDWR)
+    fifo_wd = os.open(TUBE_W_D, os.O_RDWR)
+    fifo_dw = os.fdopen(fifo_dw, "w", buffering=1)
+    fifo_wd = os.fdopen(fifo_wd, "r", buffering=1)
+    return fifo_dw, fifo_wd
+
 def setup_network():
     """Configure et retourne le socket réseau pour la logique métier"""
     try:
@@ -105,11 +113,36 @@ def start_worker_process():
 
     return worker_process
 
-def cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_process=None):
-    """Nettoie les ressources utilisées allouées au Dispatcher"""
+def close_resource(resource, label: str):
+    if not resource:
+        return
+    try:
+        resource.close()
+        print(f"{SUCCESS}[Dispatcher] - INFO : {label} fermé{RESET}")
+    except Exception as e:
+        print(f"{WARNING}[Dispatcher] - WARNING : Impossible de fermer {label} : {e}{RESET}")
+
+def cleanup_resources(
+        shm_segment,
+        dispatcher_socket,
+        health_socket,
+        fifo_wd=None,
+        fifo_dw=None,
+        worker_process=None,
+):
+    """Nettoie les ressources utilisées/allouées au Dispatcher (worker, shm, FIFOs, sockets, fichiers)."""
     print("[Dispatcher] - INFO : Nettoyage des ressources...")
 
-    # Arrêter le worker
+    # Arrêt propre du worker si possible
+    try:
+        if worker_process and worker_process.is_alive() and fifo_dw:
+            fifo_dw.write("STOP\n")
+            fifo_dw.flush()
+            worker_process.join(timeout=2)
+    except Exception as e:
+        print(f"{WARNING}[Dispatcher] - WARNING : Impossible d'envoyer STOP au worker : {e}{RESET}")
+
+    # Terminaison forcée si nécessaire
     if worker_process and worker_process.is_alive():
         print("[Dispatcher] - INFO : Arrêt du worker...")
         worker_process.terminate()
@@ -119,7 +152,11 @@ def cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_proc
             worker_process.kill()
             worker_process.join()
 
-    # Nettoyer mémoire
+    # Fermer FIFOs (avant suppression des fichiers)
+    close_resource(fifo_wd, "FIFO Worker->Dispatcher")
+    close_resource(fifo_dw, "FIFO Dispatcher->Worker")
+
+    # Nettoyer mémoire partagée
     if shm_segment:
         try:
             shm_segment.close()
@@ -128,27 +165,17 @@ def cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_proc
         except Exception as e:
             print(f"{ERROR}[Dispatcher] - ERREUR : Nettoyage mémoire : {e}{RESET}")
 
-    # Fermer sockets
-    for sock, name in [(dispatcher_socket, "métier"), (health_socket, "health")]:
-        if sock:
-            try:
-                sock.close()
-                print(f"[Dispatcher] - INFO : Socket {name} fermée")
-            except:
-                pass
+    # Fermer sockets réseau (écoute)
+    close_resource(dispatcher_socket, "Socket du Dispatcher")
+    close_resource(health_socket, "Socket du Watchdog")
 
-    # Nettoyer fichiers temporaires
-    for path in [DISPATCHER_PID_FILE, TUBE_D_W, TUBE_W_D]:
+    # Nettoyer fichiers temporaires (sans doublons)
+    for path in (DISPATCHER_PID_FILE, TUBE_D_W, TUBE_W_D):
         try:
             if os.path.exists(path):
                 os.unlink(path)
-        except:
-            pass
-    for tube in (TUBE_D_W, TUBE_W_D):
-        if os.path.exists(tube):
-            os.unlink(tube)
-    if os.path.exists(DISPATCHER_PID_FILE):
-        os.unlink(DISPATCHER_PID_FILE)
+        except Exception as e:
+            print(f"{WARNING}[Dispatcher] - WARNING : Impossible de supprimer {path} : {e}{RESET}")
 
 def handle_watchdog_connection(watchdog_connection):
     """Gère les requêtes health check du watchdog sur une connexion persistante"""
@@ -182,14 +209,17 @@ def handle_watchdog_connection(watchdog_connection):
         print(f"{ERROR}[Dispatcher] - ERROR : Erreur gestion watchdog : {e}{RESET}")
         return False
 
+
 def main():
     global shutdown_requested
     dispatcher_socket = None
     health_socket = None
     watchdog_connection = None
+    client_connection = None
     shm_segment = None
     worker_process = None
-    fifo_dw = fifo_wd = None
+    fifo_dw = None
+    fifo_wd = None
 
     # Écrire PID
     with open(DISPATCHER_PID_FILE, "w") as f:
@@ -216,15 +246,14 @@ def main():
         # Lancer worker
         worker_process = start_worker_process()
 
+        # Ouvrir les FIFOs pour dialoguer avec le worker (après démarrage)
+        fifo_dw, fifo_wd = open_named_pipes()
+
         # Timeout pour accept() - permet de vérifier régulièrement shutdown_requested
         health_socket.settimeout(1.0)
         dispatcher_socket.settimeout(1.0)
 
-        print(f"[Dispatcher] INFO : En attente de connexion client (socket {HOST}:{PORT})...")
-        client_socket, client_addr = dispatcher_socket.accept()
-        print(f"[Dispatcher] INFO : Client connecté : {client_addr}")
-
-        print('[Dispatcher] - INFO : En attente de connexions...')
+        print(f"[Dispatcher] INFO : En attente de connexions (métier {HOST}:{PORT}, health {HOST}:{HEALTH_PORT})...")
 
         # Boucle principale
         while not shutdown_requested:
@@ -257,17 +286,13 @@ def main():
                 client_connection, client_addr = dispatcher_socket.accept()
                 print(f"[Dispatcher] - INFO : Connexion client depuis {client_addr}")
 
-                # Traitement des requêtes du client
-                data = client_connection.recv(1024)
-                print(f"[Dispatcher] - INFO : Données client : {data!r}")
-
                 # Dispatch de la requête au Worker ici...
-                cmd = client_socket.recv(1024).decode().strip()
+                cmd = client_connection.recv(1024).decode().strip()
                 if not cmd:
                     print(f"[Dispatcher] Commande reçue du client : {cmd}")
                     continue
                 if cmd == "QUIT":
-                    client_socket.sendall(b"Au revoir\n")
+                    client_connection.sendall(b"Au revoir\n")
                     break
 
                 # Envoyer la commande au worker
@@ -279,7 +304,7 @@ def main():
                 print(f"[Dispatcher] Réponse worker : {reply}")
 
                 # Envoyer au client
-                client_socket.sendall((reply + "\n").encode())
+                client_connection.sendall((reply + "\n").encode())
 
             except socket.timeout:
                 # Pas de nouvelle connexion, continuer
@@ -296,38 +321,32 @@ def main():
                 print(f"{ERROR}[Dispatcher] ERREUR inattendue : {e}{RESET}")
                 break
 
+            finally:
+                close_resource(client_connection, "Socket du Client")
+                client_connection = None
+
     except Exception as exception:
         print(f"{ERROR}[Dispatcher] - ERREUR : Erreur inattendue : {exception}{RESET}")
         return 1
 
-    # Adri
     finally:
         # Fermeture de la connexion au Watchdog
         if watchdog_connection:
             try:
                 watchdog_connection.close()
                 print(f'{SUCCESS}[Dispatcher] - SUCCESS : Socket du Watchdog correctement fermée.{RESET}')
-            except:
-                pass
+            except Exception as e:
+                print(f"{WARNING}[Dispatcher] - WARNING : Impossible de fermer la socket watchdog : {e}{RESET}")
 
-        #Lorick
-        if fifo_dw:
-            fifo_dw.close()
-        if fifo_wd:
-            fifo_wd.close()
-        if dispatcher_socket:
-            dispatcher_socket.close()
-        try:
-            if worker_process and worker_process.is_alive():
-                fifo_dw = open(TUBE_D_W, "w")
-                fifo_dw.close()
-                fifo_dw.flush()
-                fifo_dw.write("STOP\n")
-        except:
-            pass
-
-        # Nettoyage des ressources allouées
-        cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_process)
+    # Nettoyage des ressources allouées
+    cleanup_resources(
+        shm_segment,
+        dispatcher_socket,
+        health_socket,
+        fifo_wd=fifo_wd,
+        fifo_dw=fifo_dw,
+        worker_process=worker_process,
+    )
 
     print(f"{SUCCESS}[Dispatcher] - INFO : Dispatcher arrêté correctement{RESET}")
     return 0
