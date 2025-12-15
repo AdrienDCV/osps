@@ -257,54 +257,66 @@ def main():
         if not shm_segment:
             return 1
 
-        # Timeout pour accept() - permet de vérifier régulièrement shutdown_requested
-        health_socket.settimeout(1.0)
-        worker_socket.settimeout(1.0)
+        # Ouvrir les FIFOs (canal principal Dispatcher <-> Worker)
+        fifo_in, fifo_out = open_named_pipes_worker()
+        print(f"{SUCCESS}[Worker] SUCCESS : Worker prêt (FIFO + health){RESET}")
 
-        print('[Worker] - INFO : En attente de connexions...')
-
+        # Boucle événementielle unique (sans thread)
         while not shutdown_requested:
-            # Gérer les connexions watchdog
-            if watchdog_connection is None:
+            read_list = [fifo_in, health_socket]
+            if watchdog_connection is not None:
+                read_list.append(watchdog_connection)
+
+            ready, _, _ = select.select(read_list, [], [], 1.0)
+            if not ready:
+                continue
+
+            # 1) Nouveau watchdog (accept)
+            if health_socket in ready:
                 try:
                     watchdog_connection, watchdog_addr = health_socket.accept()
                     print(f"{SUCCESS}[Worker] - INFO : Connexion watchdog établie depuis {watchdog_addr}{RESET}")
-                except socket.timeout:
-                    pass
                 except OSError as e:
                     if not shutdown_requested:
                         print(f"{RED}[Worker] - ERREUR : Erreur accept health : {e}{RESET}")
-            else:
+
+            # 2) Données watchdog (recv)
+            if watchdog_connection is not None and watchdog_connection in ready:
                 if not handle_watchdog_connection(watchdog_connection):
                     print(f"{WARNING}[Worker] - INFO : Fermeture connexion watchdog{RESET}")
                     try:
                         watchdog_connection.close()
-                    except:
+                    except Exception:
                         pass
                     watchdog_connection = None
 
-            # Gérer les connexions métier (clients normaux)
-            try:
-                client_connection, client_addr = worker_socket.accept()
-                print(f"[Worker] - INFO : Connexion client depuis {client_addr}")
+            # 3) Données FIFO (commande dispatcher)
+            if fifo_in in ready:
+                msg = fifo_in.readline()
+                if not msg:
+                    continue
+                msg = msg.strip()
+                if not msg:
+                    continue
 
-                # Ici tu peux traiter tes requêtes métier
-                data = client_connection.recv(1024)
-                print(f"[Worker] - INFO : Données client : {data!r}")
+                print(f"[Worker] Reçu du dispatcher : {msg}")
 
-                # Exemple de réponse
-                client_connection.send(b'worker-response')
-                client_connection.close()
+                if msg == "STOP":
+                    print(f"{WARNING}[Worker] INFO : Arrêt demandé{RESET}")
+                    break
 
-            except socket.timeout:
-                # Pas de nouvelle connexion, continuer
-                pass
-            except OSError as e:
-                if not shutdown_requested:
-                    print(f"{RED}[Worker] - ERREUR : Erreur accept métier : {e}{RESET}")
+                client_id = "client123"
+                if msg == "ping":
+                    reply = "pong"
+                elif msg == "Bonjour":
+                    reply = "Salut, comment ca va ?"
+                else:
+                    reply = delegate_to_secondary(msg, client_id)
+
+                fifo_out.write(reply + "\n")
+                fifo_out.flush()
 
         print(f"{SUCCESS}[Worker] - INFO : Sortie de la boucle principale{RESET}")
-        print('[Worker] - INFO : Fin processus 2')
 
     except Exception as exception:
         print(f"{RED}[Worker] - ERREUR : Erreur inattendue : {exception}{RESET}")
@@ -314,9 +326,15 @@ def main():
         if watchdog_connection:
             try:
                 watchdog_connection.close()
-                print(f'{SUCCESS}[Worker] - SUCCESS : Socket du Watchdog correctement fermée.{RESET}')
-            except:
+            except Exception:
                 pass
+
+        for fifo in (fifo_in, fifo_out):
+            if fifo:
+                try:
+                    fifo.close()
+                except Exception:
+                    pass
 
         cleanup_resources(shm_segment, worker_socket, health_socket)
 
