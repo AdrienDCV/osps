@@ -4,6 +4,7 @@
 import os
 import signal
 import socket
+import time
 from multiprocessing import shared_memory
 
 # Constantes affichage des logs
@@ -17,6 +18,14 @@ HOST = '127.0.0.1'   # Adresse IP localhost
 PORT = 2223          # Port pour la logique métier (client)
 HEALTH_PORT = 2225   # Port pour le watchdog
 
+# Serveur secondaire
+SECONDARY_HOST = '127.0.0.1'
+SECONDARY_PORT = 3333  # port du serveur secondaire
+
+# Tubes nommés
+TUBE_D_W = "/tmp/dwtube1"
+TUBE_W_D = "/tmp/wdtube1"
+
 WORKER_PID_FILE = "/tmp/worker.pid"
 SHM_NAME = 'shared_memory'
 
@@ -24,7 +33,6 @@ shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
 def handle_sigint(sig, frame):
-    """Gestionnaire pour SIGINT (Ctrl+C)"""
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[Worker] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
@@ -95,6 +103,86 @@ def cleanup_resources(shm_segment, worker_socket, health_socket):
     except:
         pass
 
+def delegate_to_secondary(command, client_id):
+    """Envoie la commande au serveur secondaire et retourne la réponse"""
+    try:
+        with socket.create_connection((SECONDARY_HOST, SECONDARY_PORT), timeout=5) as sock:
+            payload = f"{client_id}:{command}"
+            sock.sendall(payload.encode())
+            reply = sock.recv(1024).decode().strip()
+            return reply
+    except Exception as e:
+        print(f"{WARNING}[Worker] WARNING : Échec communication serveur secondaire : {e}{RESET}")
+        return f"DELEGATION_FAILED:{command}"
+
+def handle_fifo_communication():
+    global shutdown_requested
+    print(f"{SUCCESS}[Worker] SUCCESS : Worker prêt{RESET}")
+
+    fifo_in = fifo_out = None
+    try:
+        # Attente tubes
+        attempts = 10
+        for _ in range(attempts):
+            if shutdown_requested:
+                return
+            try:
+                fifo_in = open(TUBE_D_W, "r")
+                fifo_out = open(TUBE_W_D, "w")
+                break
+            except FileNotFoundError:
+                time.sleep(0.5)
+        else:
+            print(f"{RED}[Worker] ERREUR : Tubes non disponibles{RESET}")
+            return
+
+        while not shutdown_requested:
+            import select
+            ready, _, _ = select.select([fifo_in], [], [], 1.0)
+            if ready:
+                msg = fifo_in.readline().strip()
+                if not msg:
+                    continue
+                print(f"[Worker] Reçu du dispatcher : {msg}")
+
+                if msg == "STOP":
+                    print(f"{WARNING}[Worker] INFO : Arrêt demandé{RESET}")
+                    break
+
+                # Exemple de délégation : client_id simulé
+                client_id = "client123"
+                if msg == "ping":
+                    reply = "pong"
+                else:
+                    reply = delegate_to_secondary(msg, client_id)
+
+                if msg == "Bonjour":
+                    reply = "Salut, comment ca va ?"
+                else:
+                    reply = delegate_to_secondary(msg, client_id)
+
+                try:
+                    fifo_out.write(reply + "\n")
+                    fifo_out.flush()
+                except (BrokenPipeError, OSError):
+                    if shutdown_requested:
+                        break
+                    print(f"{WARNING}[Worker] WARNING : Dispatcher déconnecté{RESET}")
+                    break
+
+    except Exception as e:
+        if not shutdown_requested:
+            print(f"{RED}[Worker] ERREUR : Communication FIFO : {e}{RESET}")
+    finally:
+        for fifo in (fifo_in, fifo_out):
+            if fifo:
+                try:
+                    fifo.close()
+                except:
+                    pass
+        print("[Worker] INFO : Worker terminé")
+
+
 def handle_watchdog_connection(watchdog_connection):
     """Gère les requêtes health check du watchdog sur une connexion persistante"""
     try:
@@ -128,7 +216,6 @@ def handle_watchdog_connection(watchdog_connection):
         return False
 
 def main():
-    """Fonction principale du worker"""
     global shutdown_requested
 
     worker_socket = None

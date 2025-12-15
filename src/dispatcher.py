@@ -5,7 +5,6 @@ import os
 import signal
 import socket
 import sys
-import time
 from multiprocessing import Process, shared_memory
 
 # Constantes affichage des logs
@@ -31,7 +30,6 @@ shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
 def handle_sigint(sig, frame):
-    """Gestionnaire pour SIGINT (Ctrl+C)"""
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[Dispatcher] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
@@ -42,7 +40,6 @@ signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
 
 def setup_named_pipes():
-    """Configure les tubes nommés"""
     for tube in (TUBE_D_W, TUBE_W_D):
         if not os.path.exists(tube):
             os.mkfifo(tube, 0o600)
@@ -75,7 +72,6 @@ def setup_health_socket():
         return None
 
 def setup_shared_memory():
-    """Configure et retourne le segment de mémoire partagée"""
     try:
         # Nettoyer du segment de mémoire partagée existante
         try:
@@ -92,6 +88,7 @@ def setup_shared_memory():
         shm_segment = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
         print('[Dispatcher] - INFO : Mémoire partagée créée :', shm_segment.name)
         shm_segment.buf[:SHM_SIZE] = INITIAL_DATA
+        print(f"[Dispatcher] INFO : Segment mémoire partagée créé ({SHM_NAME}, {SHM_SIZE} octets)")
         return shm_segment
     except Exception as exception:
         print(f"{ERROR}[Dispatcher] - ERREUR : Erreur mémoire partagée : {exception}{RESET}")
@@ -101,7 +98,6 @@ def start_worker_process():
     """Démarre le processus worker"""
     # Import de la fonction `main ` du Worker
     from worker import main as worker_main
-
     worker_process = Process(target=worker_main)
     # Démarrafe du Worker
     worker_process.start()
@@ -148,6 +144,11 @@ def cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_proc
                 os.unlink(path)
         except:
             pass
+    for tube in (TUBE_D_W, TUBE_W_D):
+        if os.path.exists(tube):
+            os.unlink(tube)
+    if os.path.exists(DISPATCHER_PID_FILE):
+        os.unlink(DISPATCHER_PID_FILE)
 
 def handle_watchdog_connection(watchdog_connection):
     """Gère les requêtes health check du watchdog sur une connexion persistante"""
@@ -182,14 +183,13 @@ def handle_watchdog_connection(watchdog_connection):
         return False
 
 def main():
-    """Fonction principale"""
     global shutdown_requested
-
     dispatcher_socket = None
     health_socket = None
     watchdog_connection = None
     shm_segment = None
     worker_process = None
+    fifo_dw = fifo_wd = None
 
     # Écrire PID
     with open(DISPATCHER_PID_FILE, "w") as f:
@@ -220,8 +220,13 @@ def main():
         health_socket.settimeout(1.0)
         dispatcher_socket.settimeout(1.0)
 
+        print(f"[Dispatcher] INFO : En attente de connexion client (socket {HOST}:{PORT})...")
+        client_socket, client_addr = dispatcher_socket.accept()
+        print(f"[Dispatcher] INFO : Client connecté : {client_addr}")
+
         print('[Dispatcher] - INFO : En attente de connexions...')
 
+        # Boucle principale
         while not shutdown_requested:
             # Vérifier si le worker est toujours vivant
             if not worker_process.is_alive():
@@ -257,11 +262,24 @@ def main():
                 print(f"[Dispatcher] - INFO : Données client : {data!r}")
 
                 # Dispatch de la requête au Worker ici...
-                # ...
+                cmd = client_socket.recv(1024).decode().strip()
+                if not cmd:
+                    print(f"[Dispatcher] Commande reçue du client : {cmd}")
+                    continue
+                if cmd == "QUIT":
+                    client_socket.sendall(b"Au revoir\n")
+                    break
 
-                # Exemple de réponse
-                client_connection.send(b'request-dispatched')
-                client_connection.close()
+                # Envoyer la commande au worker
+                fifo_dw.write(cmd + "\n")
+                fifo_dw.flush()
+
+                # Lire la réponse
+                reply = fifo_wd.readline().strip()
+                print(f"[Dispatcher] Réponse worker : {reply}")
+
+                # Envoyer au client
+                client_socket.sendall((reply + "\n").encode())
 
             except socket.timeout:
                 # Pas de nouvelle connexion, continuer
@@ -270,10 +288,19 @@ def main():
                 if not shutdown_requested:
                     print(f"{ERROR}[Dispatcher] - ERREUR : Erreur accept métier : {e}{RESET}")
 
+            except (ConnectionResetError, BrokenPipeError):
+                print(f"{WARNING}[Dispatcher] WARNING : Client déconnecté{RESET}")
+                break
+
+            except Exception as e:
+                print(f"{ERROR}[Dispatcher] ERREUR inattendue : {e}{RESET}")
+                break
+
     except Exception as exception:
         print(f"{ERROR}[Dispatcher] - ERREUR : Erreur inattendue : {exception}{RESET}")
         return 1
 
+    # Adri
     finally:
         # Fermeture de la connexion au Watchdog
         if watchdog_connection:
@@ -282,6 +309,22 @@ def main():
                 print(f'{SUCCESS}[Dispatcher] - SUCCESS : Socket du Watchdog correctement fermée.{RESET}')
             except:
                 pass
+
+        #Lorick
+        if fifo_dw:
+            fifo_dw.close()
+        if fifo_wd:
+            fifo_wd.close()
+        if dispatcher_socket:
+            dispatcher_socket.close()
+        try:
+            if worker_process and worker_process.is_alive():
+                fifo_dw = open(TUBE_D_W, "w")
+                fifo_dw.close()
+                fifo_dw.flush()
+                fifo_dw.write("STOP\n")
+        except:
+            pass
 
         # Nettoyage des ressources allouées
         cleanup_resources(shm_segment, dispatcher_socket, health_socket, worker_process)
