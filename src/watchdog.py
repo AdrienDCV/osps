@@ -33,11 +33,12 @@ process_status = {
     "worker": False
 }
 
-def handle_sigint():
+def handle_sigint(signum, frame):
     """
     Gestionnaire pour SIGINT (Ctrl+C)
     """
     global shutdown_requested
+
     if not shutdown_requested:
         print(f"\n{WARNING}[WATCHDOG] - INFO : Signal d'arrêt reçu, arrêt en cours...{RESET}")
         shutdown_requested = True
@@ -51,8 +52,8 @@ def close_socket(sock, name):
         try:
             sock.close()
             print(f'{WARNING}[WATCHDOG] - INFO : Connexion {name} fermée{RESET}')
-        except Exception as e:
-            print(f'{ERROR}[WATCHDOG] - ERROR : Erreur fermeture {name}: {e}{RESET}')
+        except Exception as error:
+            print(f'{ERROR}[WATCHDOG] - ERROR : Erreur fermeture {name}: {error}{RESET}')
 
 def connect_to_dispatcher():
     """
@@ -95,8 +96,13 @@ def get_pid_from_file(name):
         if os.path.exists(filename):
             with open(filename, 'r') as f:
                 return int(f.read().strip())
-    except Exception:
+    except ValueError as error:
+        print(f'{ERROR}[WATCHDOG] - ERROR : le fichier contenant le PID du processus {name} est vide : {error}{RESET}')
         return None
+    except Exception as error:
+        print(f'{ERROR}[WATCHDOG] - ERROR : Une erreur est survenue : {error}{RESET}')
+        return None
+
     return None
 
 def restart_process(name):
@@ -132,8 +138,12 @@ def check_health(sock, name, retry=False):
         # Configurer un timeout de 5 secondes pour la réception
         sock.settimeout(5.0)
 
-        # Envoyer le message de santé
-        sock.send(b'watchdog-health-test')
+        # Envoyer un message visant à s'assurer de la bonne santé du processus
+        try:
+            sock.sendall(b'watchdog-health-test')
+        except (BrokenPipeError, ConnectionResetError, OSError) as error:
+            print(f'{ERROR}[WATCHDOG] - ERROR : Erreur d\'envoi vers {name} : {error}{RESET}')
+            return False
 
         # Attendre une réponse (n'importe quelle donnée)
         response = sock.recv(1024)
@@ -242,8 +252,8 @@ def main():
     except KeyboardInterrupt:
         print(f'\n{WARNING}[WATCHDOG] - INFO : Interruption clavier détectée{RESET}')
         exit_code = 0
-    except Exception as e:
-        print(f'\n{ERROR}[WATCHDOG] - ERROR : Erreur inattendue : {e}{RESET}')
+    except Exception as error:
+        print(f'\n{ERROR}[WATCHDOG] - ERROR : Erreur inattendue : {error}{RESET}')
         exit_code = 1
 
     finally:
@@ -252,18 +262,19 @@ def main():
             try:
                 dispatcher_socket.close()
                 print(f'{SUCCESS}[WATCHDOG] - SUCCESS : Connexion avec le Dispatcher correctement fermée.{RESET}')
-            except Exception as e:
-                print(f'{ERROR}[WATCHDOG] - ERROR : Erreur lors de la fermeture du Dispatcher : {e}{RESET}')
+            except Exception as error:
+                print(f'{ERROR}[WATCHDOG] - ERROR : Erreur lors de la fermeture du Dispatcher : {error}{RESET}')
 
         if worker_socket:
             try:
                 worker_socket.close()
                 print(f'{SUCCESS}[WATCHDOG] - SUCCESS : Connexion avec le Worker correctement fermée.{RESET}')
-            except Exception as e:
-                print(f'{ERROR}[WATCHDOG] - ERROR : Erreur lors de la fermeture du Worker : {e}{RESET}')
+            except Exception as error:
+                print(f'{ERROR}[WATCHDOG] - ERROR : Erreur lors de la fermeture du Worker : {error}{RESET}')
 
         print(f'{SUCCESS}[WATCHDOG] - INFO : Watchdog arrêté{RESET}')
-        return exit_code
+
+    return exit_code
 
 if __name__ == "__main__":
     sys.exit(main())
