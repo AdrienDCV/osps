@@ -31,6 +31,10 @@ TUBE_W_D = "/tmp/wdtube1"
 WORKER_PID_FILE = "/tmp/worker.pid"
 SHM_NAME = 'shared_memory'
 
+FIFO_WAIT_TIMEOUT = 10      # secondes max d'attente
+FIFO_RETRY_DELAY = 0.2      # secondes entre essais
+
+
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
@@ -108,14 +112,27 @@ def cleanup_resources(shm_segment, worker_socket, health_socket):
 
 def open_named_pipes_worker():
     """
-    Ouvre les tubes nommés sans deadlock.
-    O_RDWR évite le blocage à l'ouverture si l'autre extrémité n'est pas encore ouverte.
+    Attend que les FIFOs existent puis les ouvre sans deadlock.
+    Timeout pour éviter un blocage infini si le dispatcher ne démarre pas.
     """
-    fd_in = os.open(TUBE_D_W, os.O_RDWR)
-    fd_out = os.open(TUBE_W_D, os.O_RDWR)
-    fifo_in = os.fdopen(fd_in, "r", buffering=1)
-    fifo_out = os.fdopen(fd_out, "w", buffering=1)
-    return fifo_in, fifo_out
+    start_time = time.time()
+
+    while True:
+        if os.path.exists(TUBE_D_W) and os.path.exists(TUBE_W_D):
+            try:
+                fd_in = os.open(TUBE_D_W, os.O_RDWR)
+                fd_out = os.open(TUBE_W_D, os.O_RDWR)
+                fifo_in = os.fdopen(fd_in, "r", buffering=1)
+                fifo_out = os.fdopen(fd_out, "w", buffering=1)
+                print("[Worker] - INFO : FIFOs ouvertes avec succès")
+                return fifo_in, fifo_out
+            except OSError as e:
+                print(f"{WARNING}[Worker] - WARNING : FIFOs présentes mais non ouvrables ({e}), retry...{RESET}")
+
+        if time.time() - start_time > FIFO_WAIT_TIMEOUT:
+            raise TimeoutError("Timeout en attente de création des FIFOs")
+
+        time.sleep(FIFO_RETRY_DELAY)
 
 
 def handle_watchdog_connection(watchdog_connection):
@@ -181,7 +198,11 @@ def main():
             return 1
 
         # Ouvrir les FIFOs (canal principal Dispatcher <-> Worker)
-        fifo_in, fifo_out = open_named_pipes_worker()
+        try:
+            fifo_in, fifo_out = open_named_pipes_worker()
+        except TimeoutError as e:
+            print(f"{RED}[Worker] - ERREUR : {e}{RESET}")
+            return 1
         print(f"{SUCCESS}[Worker] SUCCESS : Worker prêt (FIFO + health){RESET}")
 
         # Boucle événementielle unique (sans thread)
@@ -216,8 +237,10 @@ def main():
             # 3) Données FIFO (commande dispatcher)
             if fifo_in in ready:
                 msg = fifo_in.readline()
-                if not msg:
-                    continue
+                if msg == "":
+                    print("[Worker] - WARNING : FIFO dispatcher fermée")
+                    shutdown_requested = True
+                    break
                 msg = msg.strip()
                 if not msg:
                     continue
@@ -240,9 +263,12 @@ def main():
                 else:
                     reply = "Instruction non comprise"
 
-                fifo_out.write(reply + "\n")
-                fifo_out.flush()
-
+                try:
+                    fifo_out.write(reply + "\n")
+                    fifo_out.flush()
+                except BrokenPipeError:
+                    print("[Worker] - ERROR : FIFO cassée")
+                    shutdown_requested = True
         print(f"{SUCCESS}[Worker] - INFO : Sortie de la boucle principale{RESET}")
 
     except Exception as exception:
