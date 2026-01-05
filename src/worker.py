@@ -105,18 +105,6 @@ def cleanup_resources(shm_segment, worker_socket, health_socket):
     except:
         pass
 
-def delegate_to_secondary(command, client_id):
-    """Envoie la commande au serveur secondaire et retourne la réponse"""
-    try:
-        with socket.create_connection((SECONDARY_HOST, SECONDARY_PORT), timeout=5) as sock:
-            payload = f"{client_id}:{command}"
-            sock.sendall(payload.encode())
-            reply = sock.recv(1024).decode().strip()
-            return reply
-    except Exception as e:
-        print(f"{WARNING}[Worker] WARNING : Échec communication serveur secondaire : {e}{RESET}")
-        return f"DELEGATION_FAILED:{command}"
-
 def open_named_pipes_worker():
     """
     Ouvre les tubes nommés sans deadlock.
@@ -127,79 +115,6 @@ def open_named_pipes_worker():
     fifo_in = os.fdopen(fd_in, "r", buffering=1)
     fifo_out = os.fdopen(fd_out, "w", buffering=1)
     return fifo_in, fifo_out
-
-def handle_fifo_communication():
-    global shutdown_requested
-    print(f"{SUCCESS}[Worker] SUCCESS : Worker prêt (FIFO){RESET}")
-
-    fifo_in = fifo_out = None
-    try:
-        # Attente que les tubes existent
-        attempts = 20
-        for _ in range(attempts):
-            if shutdown_requested:
-                return
-            if os.path.exists(TUBE_D_W) and os.path.exists(TUBE_W_D):
-                break
-            time.sleep(0.25)
-        else:
-            print(f"{RED}[Worker] ERREUR : Tubes non disponibles{RESET}")
-            return
-
-        fifo_in, fifo_out = open_named_pipes_worker()
-
-        while not shutdown_requested:
-            ready, _, _ = select.select([fifo_in], [], [], 1.0)
-            if not ready:
-                continue
-
-            msg = fifo_in.readline()
-            if not msg:
-                continue
-
-            msg = msg.strip()
-            if not msg:
-                continue
-
-            print(f"[Worker] Reçu du dispatcher : {msg}")
-
-            if msg == "STOP":
-                print(f"{WARNING}[Worker] INFO : Arrêt demandé{RESET}")
-                break
-
-            # Exemple de délégation : client_id simulé
-            client_id = "client123"
-            if msg == "ping":
-                reply = "pong"
-            elif msg == "pong":
-                reply = "ping"
-            elif msg == "Date":
-                reply = date.today().strftime("%d/%m/%Y")
-            elif msg == "Bonjour":
-                reply = "Salut, comment ca va ?"
-            else:
-                reply = delegate_to_secondary(msg, client_id)
-
-            try:
-                fifo_out.write(reply + "\n")
-                fifo_out.flush()
-            except (BrokenPipeError, OSError) as e:
-                if shutdown_requested:
-                    break
-                print(f"{WARNING}[Worker] WARNING : Écriture FIFO impossible : {e}{RESET}")
-                continue
-
-    except Exception as e:
-        if not shutdown_requested:
-            print(f"{RED}[Worker] ERREUR : Communication FIFO : {e}{RESET}")
-    finally:
-        for fifo in (fifo_in, fifo_out):
-            if fifo:
-                try:
-                    fifo.close()
-                except Exception:
-                    pass
-        print("[Worker] INFO : Worker terminé (FIFO)")
 
 
 def handle_watchdog_connection(watchdog_connection):
@@ -320,7 +235,7 @@ def main():
                 elif msg == "bonjour":
                     reply = "salut, comment ca va ?"
                 else:
-                    reply = delegate_to_secondary(msg, client_id)
+                    reply = "Instruction non comprise"
 
                 fifo_out.write(reply + "\n")
                 fifo_out.flush()
