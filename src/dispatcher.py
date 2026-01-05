@@ -29,7 +29,7 @@ INITIAL_DATA = bytearray([74, 73, 72, 71, 70, 69, 68, 67, 66, 65])
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
-def handle_sigint(sig, frame):
+def handle_sigint():
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[Dispatcher] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
@@ -46,7 +46,9 @@ def setup_named_pipes():
     print(f"[Dispatcher] - INFO : Tubes nommés configurés")
 
 def open_named_pipes():
-    """Overture des tubes nommés"""
+    """
+    Overture des tubes nommés
+    """
     fifo_dw = os.open(TUBE_D_W, os.O_RDWR)
     fifo_wd = os.open(TUBE_W_D, os.O_RDWR)
     fifo_dw = os.fdopen(fifo_dw, "w", buffering=1)
@@ -54,7 +56,9 @@ def open_named_pipes():
     return fifo_dw, fifo_wd
 
 def setup_network():
-    """Configure et retourne le socket réseau pour la logique métier"""
+    """
+    Configure et retourne le socket réseau pour la logique métier
+    """
     try:
         dispatcher_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         dispatcher_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -67,7 +71,9 @@ def setup_network():
         return None
 
 def setup_health_socket():
-    """Configure et retourne le socket réseau pour les health checks"""
+    """
+    Configure et retourne le socket réseau pour les health checks
+    """
     try:
         health_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         health_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -103,7 +109,9 @@ def setup_shared_memory():
         return None
 
 def start_worker_process():
-    """Démarre le processus worker"""
+    """
+    Démarre le processus worker
+    """
     # Import de la fonction `main ` du Worker
     from worker import main as worker_main
     worker_process = Process(target=worker_main)
@@ -130,7 +138,9 @@ def cleanup_resources(
         fifo_dw=None,
         worker_process=None,
 ):
-    """Nettoie les ressources utilisées/allouées au Dispatcher (worker, shm, FIFOs, sockets, fichiers)."""
+    """
+    Nettoie les ressources utilisées/allouées au Dispatcher (worker, shm, FIFOs, sockets, fichiers)
+    """
     print("[Dispatcher] - INFO : Nettoyage des ressources...")
 
     # Arrêt propre du worker si possible
@@ -178,7 +188,9 @@ def cleanup_resources(
             print(f"{WARNING}[Dispatcher] - WARNING : Impossible de supprimer {path} : {e}{RESET}")
 
 def handle_watchdog_connection(watchdog_connection):
-    """Gère les requêtes health check du watchdog sur une connexion persistante"""
+    """
+    Gère les requêtes health check du watchdog sur une connexion persistante
+    """
     try:
         # Timeout court (100ms) pour ne pas bloquer la boucle principale
         watchdog_connection.settimeout(0.1)
