@@ -34,8 +34,9 @@ SHM_NAME = 'shared_memory'
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
-def handle_sigint():
+def handle_sigint(signum, frame):
     global shutdown_requested
+
     if not shutdown_requested:
         print(f"\n{WARNING}[Worker] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
         shutdown_requested = True
