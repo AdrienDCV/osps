@@ -6,6 +6,7 @@ import signal
 import socket
 import time
 import select
+from datetime import date
 from multiprocessing import shared_memory
 
 # Constantes affichage des logs
@@ -170,6 +171,10 @@ def handle_fifo_communication():
             client_id = "client123"
             if msg == "ping":
                 reply = "pong"
+            elif msg == "pong":
+                reply = "ping"
+            elif msg == "Date":
+                reply = date.today().strftime("%d/%m/%Y")
             elif msg == "Bonjour":
                 reply = "Salut, comment ca va ?"
             else:
@@ -182,7 +187,7 @@ def handle_fifo_communication():
                 if shutdown_requested:
                     break
                 print(f"{WARNING}[Worker] WARNING : Écriture FIFO impossible : {e}{RESET}")
-                break
+                continue
 
     except Exception as e:
         if not shutdown_requested:
@@ -308,8 +313,12 @@ def main():
                 client_id = "client123"
                 if msg == "ping":
                     reply = "pong"
-                elif msg == "Bonjour":
-                    reply = "Salut, comment ca va ?"
+                elif msg == "pong":
+                    reply = "ping"
+                elif msg == "date":
+                    reply = date.today().strftime("%d/%m/%Y")
+                elif msg == "bonjour":
+                    reply = "salut, comment ca va ?"
                 else:
                     reply = delegate_to_secondary(msg, client_id)
 

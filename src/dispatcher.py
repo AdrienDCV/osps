@@ -286,8 +286,31 @@ def main():
                 client_connection, client_addr = dispatcher_socket.accept()
                 print(f"[Dispatcher] - INFO : Connexion client depuis {client_addr}")
 
-                # Dispatch de la requête au Worker ici...
-                cmd = client_connection.recv(1024).decode().strip()
+                try:
+                    while True:
+                        cmd = client_connection.recv(1024).decode().strip()
+                        if not cmd:
+                            # Client a fermé la connexion
+                            break
+                        if cmd == "QUIT":
+                            client_connection.sendall(b"Au revoir\n")
+                            break
+
+                        # Envoyer la commande au worker via FIFO
+                        fifo_dw.write(cmd + "\n")
+                        fifo_dw.flush()
+
+                        # Lire la réponse
+                        reply = fifo_wd.readline().strip()
+                        client_connection.sendall((reply + "\n").encode())
+
+                except (ConnectionResetError, BrokenPipeError):
+                    print(f"{WARNING}[Dispatcher] WARNING : Client déconnecté{RESET}")
+
+                finally:
+                    client_connection.close()
+                    print(f"[Dispatcher] - INFO : Connexion client fermée")
+
                 if not cmd:
                     print(f"[Dispatcher] Commande reçue du client : {cmd}")
                     continue
