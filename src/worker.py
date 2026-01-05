@@ -34,7 +34,7 @@ SHM_NAME = 'shared_memory'
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
-def handle_sigint(sig, frame):
+def handle_sigint():
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[Worker] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
@@ -156,6 +156,8 @@ def main():
     health_socket = None
     watchdog_connection = None
     shm_segment = None
+    fifo_in = None
+    fifo_out = None
 
     # Écrire PID
     with open(WORKER_PID_FILE, "w") as f:

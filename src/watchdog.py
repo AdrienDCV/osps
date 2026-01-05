@@ -17,7 +17,7 @@ DISPATCHER_PORT = 2224  # Port health du dispatcher
 WORKER_PORT = 2225      # Port health du worker
 
 # Intervalle de vérification
-HEALTH_CHECK_INTERVAL = 30  # secondes
+HEALTH_CHECK_INTERVAL = 10  # secondes
 CHECK_SPACING = 5  # secondes entre dispatcher et worker
 
 # Sockets du dispatcher et du worker
@@ -33,8 +33,10 @@ process_status = {
     "worker": False
 }
 
-def handle_sigint(sig, frame):
-    """Gestionnaire pour SIGINT (Ctrl+C)"""
+def handle_sigint():
+    """
+    Gestionnaire pour SIGINT (Ctrl+C)
+    """
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[WATCHDOG] - INFO : Signal d'arrêt reçu, arrêt en cours...{RESET}")
@@ -84,7 +86,44 @@ def connect_to_worker():
         print(f'{ERROR}[WATCHDOG] - ERROR : Impossible de se connecter au worker : {error}{RESET}')
         return None
 
-def check_health(sock, name):
+def get_pid_from_file(name):
+    """
+    Lit le PID du processus depuis un fichier (ex: dispatcher.pid)
+    """
+    filename = f"{name.lower()}.pid"
+    try:
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                return int(f.read().strip())
+    except Exception:
+        return None
+    return None
+
+def restart_process(name):
+    """
+    Relance le processus de manière totalement indépendante.
+    """
+    pid = get_pid_from_file(name)
+    script_target = "dispatcher.py" if name == "Dispatcher" else "worker.py"
+
+    if pid:
+        try:
+            print(f'{WARNING}[WATCHDOG] - INFO  : Envoi du signal d\'arrêt au PID {pid} ({name})...{RESET}')
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(2)
+        except OSError:
+            pass
+
+    print(f'{SUCCESS}[WATCHDOG] - ACTION : Relance de {script_target} en arrière-plan...{RESET}')
+
+    # os.P_NOWAIT : Lance le processus et rend la main immédiatement au Watchdog.
+    # sys.executable est le chemin vers python.
+    # Les arguments sont : mode, chemin_executable, arg0, arg1, ...
+    os.spawnl(os.P_NOWAIT, sys.executable, sys.executable, script_target)
+
+    print(f'{SUCCESS}[WATCHDOG] - INFO  : {name} a été détaché du Watchdog.{RESET}')
+
+def check_health(sock, name, retry=False):
     """
     Vérifie l'état d'un processus via sa socket.
     Retourne True si le processus répond correctement, False sinon.
@@ -116,7 +155,12 @@ def check_health(sock, name):
             return False
 
     except socket.timeout:
-        print(f'{ERROR}[WATCHDOG] - ERROR : Aucun message reçu de {name} dans la limite des 5 secondes (timeout){RESET}')
+        if not retry:
+            print(f'{WARNING}[WATCHDOG] - WARNING : Timeout de 5s pour {name}. Nouvelle tentative...{RESET}')
+            # On vide un peu le buffer si besoin avant de retenter
+            return check_health(sock, name, retry=True)
+
+        print(f'{ERROR}[WATCHDOG] - ERROR : Deuxième timeout pour {name}. Le service semble figé.{RESET}')
         if name == "Dispatcher":
             process_status["dispatcher"] = False
         else:
@@ -151,9 +195,18 @@ def main():
 
             if dispatcher_socket:
                 if not check_health(dispatcher_socket, "Dispatcher"):
-                    print(f'{WARNING}[WATCHDOG] - INFO : Dispatcher défaillant, fermeture de la connexion{RESET}')
+                    print(f'{WARNING}[WATCHDOG] - INFO : Dispatcher défaillant, relance en cours...{RESET}')
                     close_socket(dispatcher_socket, "dispatcher")
                     dispatcher_socket = None
+
+                    # On ferme aussi préventivement le worker car le dispatcher va le relancer
+                    if worker_socket:
+                        close_socket(worker_socket, "worker")
+                        worker_socket = None
+
+                    restart_process("Dispatcher")
+                    time.sleep(2)
+                    continue
 
             # Attendre avant de vérifier le worker
             if shutdown_requested:
@@ -167,9 +220,17 @@ def main():
 
             if worker_socket:
                 if not check_health(worker_socket, "Worker"):
-                    print(f'{WARNING}[WATCHDOG] - INFO : Worker défaillant, fermeture de la connexion{RESET}')
+                    print(f'{WARNING}[WATCHDOG] - INFO : Worker défaillant. Comme il dépend du Dispatcher, relance du bloc complet...{RESET}')
                     close_socket(worker_socket, "worker")
                     worker_socket = None
+
+                    # Si le worker est mort, il est plus sûr de redémarrer le dispatcher
+                    # car c'est lui qui gère la mémoire partagée et les tubes.
+                    if dispatcher_socket:
+                        close_socket(dispatcher_socket, "dispatcher")
+                        dispatcher_socket = None
+
+                    restart_process("Dispatcher")
 
             # Attendre avant le prochain cycle de vérification
             remaining_time = HEALTH_CHECK_INTERVAL - CHECK_SPACING
