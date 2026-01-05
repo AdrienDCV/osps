@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import sys
+import select
 from multiprocessing import Process, shared_memory
 
 # Constantes affichage des logs
@@ -29,7 +30,7 @@ INITIAL_DATA = bytearray([74, 73, 72, 71, 70, 69, 68, 67, 66, 65])
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
-def handle_sigint():
+def handle_sigint(signum, frame):
     global shutdown_requested
     if not shutdown_requested:
         print(f"\n{WARNING}[Dispatcher] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
@@ -267,6 +268,7 @@ def main():
 
         print(f"[Dispatcher] INFO : En attente de connexions (métier {HOST}:{PORT}, health {HOST}:{HEALTH_PORT})...")
 
+
         # Boucle principale
         while not shutdown_requested:
             # Vérifier si le worker est toujours vivant
@@ -297,24 +299,33 @@ def main():
             try:
                 client_connection, client_addr = dispatcher_socket.accept()
                 print(f"[Dispatcher] - INFO : Connexion client depuis {client_addr}")
-
                 try:
-                    while True:
-                        cmd = client_connection.recv(1024).decode().strip()
-                        if not cmd:
-                            # Client a fermé la connexion
-                            break
-                        if cmd == "QUIT":
-                            client_connection.sendall(b"Au revoir\n")
-                            break
-
-                        # Envoyer la commande au worker via FIFO
-                        fifo_dw.write(cmd + "\n")
-                        fifo_dw.flush()
-
-                        # Lire la réponse
-                        reply = fifo_wd.readline().strip()
-                        client_connection.sendall((reply + "\n").encode())
+                    while not shutdown_requested:
+                        # On surveille la socket client ET la socket watchdog en même temps
+                        potential_readers = [client_connection]
+                        if watchdog_connection:
+                            potential_readers.append(watchdog_connection)
+                        ready_to_read, _, _ = select.select(potential_readers, [], [], 1.0)
+                        if not ready_to_read:
+                            continue # Personne n'a rien envoyé, on reboucle
+                        # Si le watchdog envoie quelque chose, on lui répond sans interrompre le client
+                        if watchdog_connection in ready_to_read:
+                            if not handle_watchdog_connection(watchdog_connection):
+                                watchdog_connection.close()
+                                watchdog_connection = None
+                        # Si le client envoie quelque chose
+                        if client_connection in ready_to_read:
+                            cmd = client_connection.recv(1024).decode().strip()
+                            if not cmd:
+                                break
+                            if cmd == "QUIT":
+                                client_connection.sendall(b"Au revoir\n")
+                                break
+                            # Traitement normal vers le worker
+                            fifo_dw.write(cmd + "\n")
+                            fifo_dw.flush()
+                            reply = fifo_wd.readline().strip()
+                            client_connection.sendall((reply + "\n").encode())
 
                 except (ConnectionResetError, BrokenPipeError):
                     print(f"{WARNING}[Dispatcher] WARNING : Client déconnecté{RESET}")
