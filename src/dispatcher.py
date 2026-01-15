@@ -6,27 +6,29 @@ import signal
 import socket
 import sys
 import select
-from multiprocessing import Process, shared_memory
+from multiprocessing import Process, shared_memory, resource_tracker
 
 # Constantes affichage des logs
-ERROR = '\033[91m'
-SUCCESS = '\033[92m'
-WARNING = '\033[93m'
-RESET = '\033[0m'
+ERROR = '\033[91m'    # Rouge pour les erreurs
+SUCCESS = '\033[92m'  # Vert pour les succès
+WARNING = '\033[93m'  # Jaune pour les avertissements
+RESET = '\033[0m'     # Réinitialisation de la couleur
 
 # Constantes configuration réseau
 HOST = '127.0.0.1'   # Adresse IP localhost
 PORT = 2222          # Port pour la logique métier
-HEALTH_PORT = 2224   # Port pour le watchdog
+HEALTH_PORT = 2224   # Port pour le Watchdog
 
+# Fichiers et tubes nommés utilisés
 TUBE_D_W = "/tmp/dwtube1"
 TUBE_W_D = "/tmp/wdtube1"
 DISPATCHER_PID_FILE = "/tmp/dispatcher.pid"
 
+# Mémoire partagée
 SHM_NAME = 'shared_memory'
 SHM_SIZE = 10
-INITIAL_DATA = bytearray([74, 73, 72, 71, 70, 69, 68, 67, 66, 65])
 
+# Flag global pour arrêter proprement le Dispatcher
 shutdown_requested = False
 
 # Gestion des signaux (CTRL + C)
@@ -35,26 +37,36 @@ def handle_sigint(signum, frame):
     if not shutdown_requested:
         print(f"\n{WARNING}[Dispatcher] - INFO : Signal d'arrêt reçu (PID: {os.getpid()}){RESET}")
         shutdown_requested = True
+        shutdown_requested = True
 
 # Configuration des signaux
 signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
 
 def setup_named_pipes():
-    for tube in (TUBE_D_W, TUBE_W_D):
-        if not os.path.exists(tube):
-            os.mkfifo(tube, 0o600)
-    print(f"[Dispatcher] - INFO : Tubes nommés configurés")
+    # Création des tubes nommés si inexistants
+    try:
+        for tube in (TUBE_D_W, TUBE_W_D):
+            if not os.path.exists(tube):
+                os.mkfifo(tube, 0o600)
+        print(f"[Dispatcher] - INFO : Tubes nommés configurés")
+    except OSError as e:
+        print(f"{ERROR}[Dispatcher] - ERREUR : Impossible de créer les FIFOs : {e}{RESET}")
+        raise  # remonter l'erreur pour arrêt propre
 
 def open_named_pipes():
     """
-    Overture des tubes nommés
+    Ouverture des tubes nommés pour lecture/écriture
     """
-    fifo_dw = os.open(TUBE_D_W, os.O_RDWR)
-    fifo_wd = os.open(TUBE_W_D, os.O_RDWR)
-    fifo_dw = os.fdopen(fifo_dw, "w", buffering=1)
-    fifo_wd = os.fdopen(fifo_wd, "r", buffering=1)
-    return fifo_dw, fifo_wd
+    try:
+        fifo_dw = os.open(TUBE_D_W, os.O_RDWR)
+        fifo_wd = os.open(TUBE_W_D, os.O_RDWR)
+        fifo_dw = os.fdopen(fifo_dw, "w", buffering=1)
+        fifo_wd = os.fdopen(fifo_wd, "r", buffering=1)
+        return fifo_dw, fifo_wd
+    except OSError as e:
+        print(f"{ERROR}[Dispatcher] - ERREUR : Impossible d'ouvrir les FIFOs : {e}{RESET}")
+        raise
 
 def setup_network():
     """
@@ -87,49 +99,76 @@ def setup_health_socket():
         return None
 
 def setup_shared_memory():
+    """
+    Crée ou réinitialise le segment de mémoire partagée
+    """
     try:
-        # Nettoyer du segment de mémoire partagée existante
+        # Nettoyage du segment existant (inchangé)
         try:
-            shm_segment = shared_memory.SharedMemory(name=SHM_NAME)
+            temp_shm = shared_memory.SharedMemory(name=SHM_NAME)
             print(f'{WARNING}[Dispatcher] - WARNING : Mémoire existante, nettoyage...{RESET}')
-            shm_segment.close()
-            shm_segment.unlink()
-
+            temp_shm.close()
+            temp_shm.unlink()
         except FileNotFoundError:
-            # Si le fichier n'est pas trouvé, il n'y a rien à nettoyer
             pass
 
-        # Création du nouveau segemnt de mémoire partagée
+        # Création du nouveau segment
         shm_segment = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
-        print('[Dispatcher] - INFO : Mémoire partagée créée :', shm_segment.name)
-        shm_segment.buf[:SHM_SIZE] = INITIAL_DATA
+
         print(f"[Dispatcher] INFO : Segment mémoire partagée créé ({SHM_NAME}, {SHM_SIZE} octets)")
         return shm_segment
+
     except Exception as exception:
         print(f"{ERROR}[Dispatcher] - ERREUR : Erreur mémoire partagée : {exception}{RESET}")
+        # Si le segment a été créé mais qu'une erreur suit, on le détruit immédiatement
+        if shm_segment:
+            try:
+                shm_segment.close()
+                shm_segment.unlink()
+                print(f"{WARNING}[Dispatcher] - INFO : Mémoire défectueuse supprimée{RESET}")
+            except:
+                pass
         return None
 
 def start_worker_process():
     """
     Démarre le processus worker
     """
-    # Import de la fonction `main ` du Worker
     from worker import main as worker_main
     worker_process = Process(target=worker_main)
-    # Démarrafe du Worker
-    worker_process.start()
-    print(f"{SUCCESS}[Dispatcher] - SUCCESS : Worker démarré (PID: {worker_process.pid}){RESET}")
-
+    try:
+        worker_process.start()
+        print(f"{SUCCESS}[Dispatcher] - SUCCESS : Worker démarré (PID: {worker_process.pid}){RESET}")
+    except Exception as e:
+        print(f"{ERROR}[Dispatcher] - ERREUR : Impossible de démarrer le worker : {e}{RESET}")
+        return None
     return worker_process
 
 def close_resource(resource, label: str):
+    """
+    Ferme proprement une ressource (socket, FIFO, etc.) avec gestion d'erreurs.
+    Si c'est une socket, on tente d'abord un shutdown pour libération propre.
+    """
     if not resource:
         return
     try:
+        if isinstance(resource, socket.socket):
+            try:
+                resource.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass  # Déjà fermé ou non connecté
         resource.close()
         print(f"{SUCCESS}[Dispatcher] - INFO : {label} fermé{RESET}")
     except Exception as error:
         print(f"{WARNING}[Dispatcher] - WARNING : Impossible de fermer {label} : {error}{RESET}")
+
+    # Suppression fichiers temporaires
+    for path in (DISPATCHER_PID_FILE, TUBE_D_W, TUBE_W_D):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception as error:
+            print(f"{WARNING}[Dispatcher] - WARNING : Impossible de supprimer {path} : {error}{RESET}")
 
 def cleanup_resources(
         shm_segment,
@@ -140,7 +179,7 @@ def cleanup_resources(
         worker_process=None,
 ):
     """
-    Nettoie les ressources utilisées/allouées au Dispatcher (worker, shm, FIFOs, sockets, fichiers)
+    Nettoie les ressources utilisées/allouées au Dispatcher
     """
     print("[Dispatcher] - INFO : Nettoyage des ressources...")
 
@@ -163,28 +202,34 @@ def cleanup_resources(
             worker_process.kill()
             worker_process.join()
 
-    # Fermer FIFOs (avant suppression des fichiers)
+    # Fermeture des FIFOs
     close_resource(fifo_wd, "FIFO Worker->Dispatcher")
     close_resource(fifo_dw, "FIFO Dispatcher->Worker")
 
-    # Nettoyer mémoire partagée
+    # Nettoyage mémoire partagée (AVANT de fermer les sockets)
     if shm_segment:
         try:
             shm_segment.close()
-            shm_segment.unlink()
-            print("[Dispatcher] - INFO : Mémoire partagée nettoyée")
+            print("[Dispatcher] - INFO : Mémoire partagée fermée")
+
+            try:
+                shm_segment.unlink()
+                print("[Dispatcher] - INFO : Mémoire partagée supprimée")
+            except Exception as error:
+                print(f"{WARNING}[Dispatcher] - WARNING : Impossible de supprimer la mémoire : {error}{RESET}")
         except Exception as error:
             print(f"{ERROR}[Dispatcher] - ERREUR : Nettoyage mémoire : {error}{RESET}")
 
-    # Fermer sockets réseau (écoute)
+    # Fermeture des sockets réseau
     close_resource(dispatcher_socket, "Socket du Dispatcher")
     close_resource(health_socket, "Socket du Watchdog")
 
-    # Nettoyer fichiers temporaires (sans doublons)
+    # Suppression fichiers temporaires (EN DERNIER)
     for path in (DISPATCHER_PID_FILE, TUBE_D_W, TUBE_W_D):
         try:
             if os.path.exists(path):
                 os.unlink(path)
+                print(f"{SUCCESS}[Dispatcher] - INFO : {path} supprimé{RESET}")
         except Exception as error:
             print(f"{WARNING}[Dispatcher] - WARNING : Impossible de supprimer {path} : {error}{RESET}")
 
@@ -193,37 +238,36 @@ def handle_watchdog_connection(watchdog_connection):
     Gère les requêtes health check du watchdog sur une connexion persistante
     """
     try:
-        # Timeout court (100ms) pour ne pas bloquer la boucle principale
-        watchdog_connection.settimeout(0.1)
-
+        watchdog_connection.settimeout(0.1)  # Timeout très court
         try:
             data = watchdog_connection.recv(1024)
-
             if not data:
-                # Connexion fermée par le watchdog
                 print(f"{WARNING}[Dispatcher] - INFO : Watchdog a fermé la connexion{RESET}")
                 return False
 
             print(f"[Dispatcher] - INFO : Health check reçu : {data!r}")
-
             if data == b'watchdog-health-test':
-                watchdog_connection.send(b'dispatcher-alive')
+                try:
+                    watchdog_connection.send(b'dispatcher-alive')
+                except OSError as e:
+                    print(f"{ERROR}[Dispatcher] - ERROR : Envoi watchdog impossible : {e}{RESET}")
+                    return False
                 return True
 
         except socket.timeout:
-            # Etant donné la durée très courte du timeout (100ms) pour ne pas bloquer la boucle principale, même si aucune
-            # donnée n'est reçue, cela n'indique pas une coupure de communication pour autant
             return True
         except OSError as error:
             print(f"{ERROR}[Dispatcher] - ERROR : Erreur lecture watchdog : {error}{RESET}")
             return False
 
-    except Exception as error:
-        print(f"{ERROR}[Dispatcher] - ERROR : Erreur gestion watchdog : {error}{RESET}")
+    except OSError as error:
+        print(f"{ERROR}[Dispatcher] - ERROR : Erreur socket watchdog : {error}{RESET}")
         return False
 
-
 def main():
+    """
+    Programme principal
+    """
     global shutdown_requested
     dispatcher_socket = None
     health_socket = None
@@ -234,50 +278,57 @@ def main():
     fifo_dw = None
     fifo_wd = None
 
-    # Écrire PID
-    with open(DISPATCHER_PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
+    # Création des tubes nommés
     setup_named_pipes()
 
     try:
-        # Configuration
+        # Configuration réseau
         dispatcher_socket = setup_network()
         if not dispatcher_socket:
             return 1
-
         health_socket = setup_health_socket()
         if not health_socket:
             return 1
 
         print('[Dispatcher] - INFO : Début processus 1')
 
+        # Mémoire partagée
         shm_segment = setup_shared_memory()
         if not shm_segment:
             return 1
 
-        # Lancer worker
+        # Lancement du worker
         worker_process = start_worker_process()
 
-        # Ouvrir les FIFOs pour dialoguer avec le worker (après démarrage)
-        fifo_dw, fifo_wd = open_named_pipes()
+        # Ouverture des FIFOs pour dialogue avec le worker
+        try:
+            fifo_dw, fifo_wd = open_named_pipes()
+            print("[Dispatcher] - INFO : FIFOs ouvertes avec succès")
+        except Exception:
+            return 1
 
-        # Timeout pour accept() - permet de vérifier régulièrement shutdown_requested
+        try:
+            with open(DISPATCHER_PID_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception as e:
+            print(f"{ERROR}[Dispatcher] - ERREUR : Impossible d'écrire le PID : {e}{RESET}")
+            return 1
+
+        # Timeout pour accept() afin de vérifier shutdown_requested
         health_socket.settimeout(1.0)
         dispatcher_socket.settimeout(1.0)
 
         print(f"[Dispatcher] INFO : En attente de connexions (métier {HOST}:{PORT}, health {HOST}:{HEALTH_PORT})...")
 
-
         # Boucle principale
         while not shutdown_requested:
-            # Vérifier si le worker est toujours vivant
             if not worker_process.is_alive():
                 print(f"{WARNING}[Dispatcher] - WARNING : Worker arrêté, fin du dispatcher{RESET}")
                 break
 
-            # Gérer les connexions watchdog
+            # Gestion de la communication avec le Watchdog
             if watchdog_connection is None:
+                # Si la connexion n'existe pas, alors une nouvelle est créée
                 try:
                     watchdog_connection, watchdog_addr = health_socket.accept()
                     print(f"{SUCCESS}[Dispatcher] - INFO : Connexion watchdog établie depuis {watchdog_addr}{RESET}")
@@ -287,33 +338,39 @@ def main():
                     if not shutdown_requested:
                         print(f"{ERROR}[Dispatcher] - ERREUR : Erreur accept health : {error}{RESET}")
             else:
+                # S'il en existe une, alors le Dispatcher s'attend à recevoir des requêtes de santé de la part du Watchdog
                 if not handle_watchdog_connection(watchdog_connection):
-                    print(f"{WARNING}[Dispatcher] - INFO : Fermeture connexion watchdog{RESET}")
                     try:
                         watchdog_connection.close()
-                    except Exception as exception:
-                        print(f"{ERROR}[Dispatcher] - ERROR : Une erreur est survenue à la fermeture de la connexion avec le Watchdog : {exception}{RESET}")
+                    except Exception:
+                        pass
                     watchdog_connection = None
 
-            # Gérer les connexions métier (client)
+            # Gestion de la communication avec le Client
             try:
                 client_connection, client_addr = dispatcher_socket.accept()
                 print(f"[Dispatcher] - INFO : Connexion client depuis {client_addr}")
                 try:
                     while not shutdown_requested:
-                        # On surveille la socket client ET la socket watchdog en même temps
                         potential_readers = [client_connection]
                         if watchdog_connection:
                             potential_readers.append(watchdog_connection)
-                        ready_to_read, _, _ = select.select(potential_readers, [], [], 1.0)
+                        try:
+                            ready_to_read, _, _ = select.select(potential_readers, [], [], 1.0)     # Permet d'alterner la lecture de la socket du Watchdog et du Client pour les gérer simultanément
+                        except (OSError, ValueError) as e:
+                            print(f"{ERROR}[Dispatcher] - ERREUR : select() échoué : {e}{RESET}")
+                            break
+
                         if not ready_to_read:
-                            continue # Personne n'a rien envoyé, on reboucle
-                        # Si le watchdog envoie quelque chose, on lui répond sans interrompre le client
+                            continue
+
+                        # Lecture de la socket du Watchdog
                         if watchdog_connection in ready_to_read:
                             if not handle_watchdog_connection(watchdog_connection):
                                 watchdog_connection.close()
                                 watchdog_connection = None
-                        # Si le client envoie quelque chose
+
+                        # Lecture de la socket du Client
                         if client_connection in ready_to_read:
                             data = client_connection.recv(1024)
                             if not data:
@@ -322,11 +379,20 @@ def main():
                             if cmd == "QUIT":
                                 client_connection.sendall(b"Au revoir\n")
                                 break
-                            # Traitement normal vers le worker
-                            fifo_dw.write(cmd + "\n")
-                            fifo_dw.flush()
-                            reply = fifo_wd.readline().strip()
-                            client_connection.sendall((reply + "\n").encode())
+                            try:
+                                # Transmission du traitement au Worker
+                                fifo_dw.write(cmd + "\n")
+                                fifo_dw.flush()
+                                reply = fifo_wd.readline()
+                                if not reply:
+                                    raise RuntimeError("Worker ne répond plus")
+                                # Transmission de la réponse du Worker au Client
+                                client_connection.sendall((reply.strip() + "\n").encode())
+                            except (OSError, BrokenPipeError) as e:
+                                print(f"{ERROR}[Dispatcher] - ERREUR : Communication worker impossible : {e}{RESET}")
+                                break
+                            except Exception as e:
+                                print(f"{ERROR}[Dispatcher] - ERREUR : Réponse worker invalide : {e}{RESET}")
 
                 except (ConnectionResetError, BrokenPipeError):
                     print(f"{WARNING}[Dispatcher] WARNING : Client déconnecté prématurément{RESET}")
@@ -337,10 +403,8 @@ def main():
                     client_connection = None
 
             except socket.timeout:
-                # Aucun nouveau client ne s'est connecté pendant le délai d'attente
                 pass
             except OSError as error:
-                # On n'affiche l'erreur que si on n'est pas en train de fermer le serveur
                 if not shutdown_requested:
                     print(f"{ERROR}[Dispatcher] - ERREUR : Erreur critique accept métier : {error}{RESET}")
             except Exception as error:
@@ -356,19 +420,18 @@ def main():
         if watchdog_connection:
             try:
                 watchdog_connection.close()
-                print(f'{SUCCESS}[Dispatcher] - SUCCESS : Socket du Watchdog correctement fermée.{RESET}')
-            except Exception as error:
-                print(f"{WARNING}[Dispatcher] - WARNING : Impossible de fermer la socket watchdog : {error}{RESET}")
+            except Exception:
+                pass
 
-    # Nettoyage des ressources allouées
-    cleanup_resources(
-        shm_segment,
-        dispatcher_socket,
-        health_socket,
-        fifo_wd=fifo_wd,
-        fifo_dw=fifo_dw,
-        worker_process=worker_process,
-    )
+        # Nettoyage des ressources
+        cleanup_resources(
+            shm_segment,
+            dispatcher_socket,
+            health_socket,
+            fifo_wd=fifo_wd,
+            fifo_dw=fifo_dw,
+            worker_process=worker_process,
+        )
 
     print(f"{SUCCESS}[Dispatcher] - INFO : Dispatcher arrêté correctement{RESET}")
     return 0
