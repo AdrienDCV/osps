@@ -16,6 +16,7 @@ Nous avons également fait le choix de ne pas lancer le Dispatcher ni le Worker 
 solution de monitoring relativement indépendante et ouverte à d'autres solutions.
 
 Architecture Dispatcher-Worker : `Protocole "basique"`.
+![img.png](architecture.png)
 
 ## Lancer les programmes
 
@@ -43,3 +44,14 @@ Exécuter le programme `client.py`:
 ```bash
 python client.py
 ```
+
+## Informations utiles
+
+Le Watchdog redémarre le Dispatcher dans le cas où ce dernier ou bien le Worker rencontre un problème. Le nouveau
+Dispatcher et le nouveau Worker sont relancés en arrière plan pour éviter que le signal CTRL + C ne tue le Watchdog par la
+même occasion ou inversement. Etant donné qu'il n'est pas possible d'attacher un terminal à un processus lancer en arrière plan,
+le programme `stop_all.py` permet de stopper en toute sécurité les processus du Dispatcher et du Worker.
+
+Le Client peut se connecter à tout moment tant que le Dispatcher, et par conséquent le Worker, sont démarrés.
+
+Le Watchdog peut se connecter à tout moment tant que le Dispatcher, et par conséquent le Worker, sont démarrés

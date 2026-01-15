@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import socket
 
 # Constantes pour l'affichage coloré des logs
